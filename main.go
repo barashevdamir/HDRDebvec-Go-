@@ -3,11 +3,18 @@ package main
 import (
 	"fmt"
 	"gocv.io/x/gocv"
+	"gonum.org/v1/gonum/mat"
+	"gonum.org/v1/plot"
+	"gonum.org/v1/plot/plotter"
+	"gonum.org/v1/plot/vg"
+	"image/color"
+	"log"
 	"math"
 	"sync"
 )
 
 const l = 10 // Коэффициент гладкости
+const n = 256
 
 // HDR структура для создания HDR изображений
 type HDR struct {
@@ -24,6 +31,12 @@ type HDR struct {
 	ZG           [][]uint8   // Массив для хранения зеленого канала
 	ZR           [][]uint8   // Массив для хранения красного канала
 	Bij          [][]float64 // Массив для хранения логарифмических времен экспозиции
+	CRFB         []float64   // Массив для хранения функции отклика для синего канала
+	CRFG         []float64   // Массив для хранения функции отклика для зеленого канала
+	CRFR         []float64   // Массив для хранения функции отклика для красного канала
+	lEB          []float64   // Массив для хранения логарифмической освещенности в местоположении пикселя i для синего канала
+	lEG          []float64   // Массив для хранения логарифмической освещенности в местоположении пикселя i для зеленого канала
+	lER          []float64   // Массив для хранения логарифмической освещенности в местоположении пикселя i для красного канала
 }
 
 // newHDR создает новый экземпляр HDR
@@ -129,7 +142,7 @@ func (hdr *HDR) flattenChannel(channelIndex int, wg *sync.WaitGroup) {
 		for y := 0; y < rows; y++ {
 			for x := 0; x < cols; x++ {
 				pixel := img.GetUCharAt(y, x*img.Channels()+channelIndex)
-				hdr.FlattenImage[i][channelIndex][y*cols+x] = pixel // Обратите внимание на правильное заполнение
+				hdr.FlattenImage[i][channelIndex][y*cols+x] = pixel
 			}
 		}
 	}
@@ -145,12 +158,22 @@ func generateIndices(samples int) []int {
 
 // samplingValues выбирает пиксели из каждого изображения для определения функции отклика камеры.
 func (hdr *HDR) samplingValues() {
-	pixels := hdr.Row * hdr.Col                             // Общее количество пикселей в изображении.
-	samples := int(math.Ceil(float64(255*2/(hdr.N-1))) * 2) // Количество образцов для выборки.
-	step := pixels / samples                                // Шаг выборки для равномерного распределения выборки по всему изображению.
+	// Общее количество пикселей в изображении.
+	pixels := hdr.Row * hdr.Col
+	// Количество образцов для выборки.
+	samples := int(math.Ceil(float64(255*2/(hdr.N-1))) * 2)
+	if samples > pixels {
+		samples = pixels
+	}
+	// Шаг выборки для равномерного распределения выборки по всему изображению.
+	step := int(math.Ceil(float64(pixels) / float64(samples)))
 	hdr.Indices = make([]int, 0, samples)
 	for i := 0; i < pixels; i += step {
 		hdr.Indices = append(hdr.Indices, i)
+	}
+	// Если последний индекс не был добавлен и еще есть место, добавим его вручную
+	if len(hdr.Indices) < samples && hdr.Indices[len(hdr.Indices)-1] != pixels-1 {
+		hdr.Indices = append(hdr.Indices, pixels-1)
 	}
 	hdr.FlattenImage = make([][][]uint8, hdr.N)
 	for i := range hdr.FlattenImage {
@@ -217,6 +240,83 @@ func (hdr *HDR) samplingValues() {
 	}
 }
 
+// CRFsolve решает систему уравнений для получения функции отклика камеры и логарифмических значений освещенности.
+func (hdr *HDR) CRFsolve(Z [][]uint8) (CRF []float64, logE []float64) {
+	s1, s2 := len(Z), len(Z[0])
+	U := mat.NewDense(s1*s2+n+1, n+s1, nil)
+	V := mat.NewDense(U.RawMatrix().Rows, 1, nil)
+	k := 0
+	for i := 0; i < s1; i++ {
+		for j := 0; j < s2; j++ {
+			wij := float64(hdr.W[Z[i][j]])
+			U.Set(k, int(Z[i][j]), wij)
+			U.Set(k, n+i, -wij)
+			V.Set(k, 0, wij*hdr.Bij[i][j])
+			k++
+		}
+	}
+	U.Set(k, 129, 0)
+	k++
+	for i := 1; i < n-2; i++ {
+		U.Set(k, i, float64(hdr.L*hdr.W[i+1]))
+		U.Set(k, i+1, float64(-2*hdr.L*hdr.W[i+1]))
+		U.Set(k, i+2, float64(-hdr.L*hdr.W[i+1]))
+		k++
+	}
+	var M mat.Dense
+	M.Solve(U, V)
+	CRF = mat.Col(nil, 0, M.Slice(0, n, 0, 1))
+	logE = mat.Col(nil, 0, M.Slice(n, M.RawMatrix().Rows, 0, 1))
+
+	return CRF, logE
+}
+
+// plotResponseCurves отображает графики функций отклика для каждого цветового канала.
+func (hdr *HDR) plotResponseCurves() {
+	p := plot.New()
+	p.Title.Text = "Кривые отклика"
+	p.X.Label.Text = "Значение пикселя"
+	p.Y.Label.Text = "log(CRF)"
+
+	// Создание линий для каждого цветового канала
+	plotCRF := func(crf []float64, clr color.Color) {
+		pts := make(plotter.XYs, 256)
+		for i := range pts {
+			pts[i].X = float64(i)
+			pts[i].Y = math.Exp(crf[i])
+		}
+
+		line, err := plotter.NewLine(pts)
+		if err != nil {
+			log.Fatalf("Ошибка при создании линии: %v", err)
+		}
+		line.Color = clr
+
+		p.Add(line)
+	}
+
+	plotCRF(hdr.CRFB, color.RGBA{R: 0, G: 0, B: 255, A: 255})
+	plotCRF(hdr.CRFG, color.RGBA{R: 0, G: 255, B: 0, A: 255})
+	plotCRF(hdr.CRFR, color.RGBA{R: 255, G: 0, B: 0, A: 255})
+
+	// Сохранение графика в файл
+	if err := p.Save(5*vg.Inch, 5*vg.Inch, "results/curvesCRF.png"); err != nil {
+		log.Fatalf("Ошибка при сохранении графика: %v", err)
+	}
+
+}
+
+// Process вызывает предыдущие методы для построения функции отклика и подготовки данных для восстановления карты освещенности HDR.
+func (hdr *HDR) Process() {
+	// Вызов методов для подготовки данных
+	hdr.weightingFunction()
+	hdr.samplingValues()
+	// Выполнение CRFsolve для каждого цветового канала
+	hdr.CRFB, hdr.lEB = hdr.CRFsolve(hdr.ZB)
+	hdr.CRFG, hdr.lEG = hdr.CRFsolve(hdr.ZG)
+	hdr.CRFR, hdr.lER = hdr.CRFsolve(hdr.ZR)
+}
+
 func main() {
 	filenames := []string{"uploads/image0.jpg", "uploads/image1.jpg", "uploads/image2.jpg"}
 	exposureTimes := []float32{1 / 6.0, 1.3, 5.0}
@@ -231,9 +331,5 @@ func main() {
 			return
 		}
 	}
-	hdr.weightingFunction()
-	// Вывод значений весовой функции (можно выводить часть массива для проверки)
-	fmt.Println("Пример значений весовой функции:", hdr.W[125:135])
-	hdr.samplingValues()
-
+	hdr.Process()
 }
